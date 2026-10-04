@@ -81,6 +81,7 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       - name: Roll out new revisions
         run: |
+          az config set extension.use_dynamic_install=yes_without_prompt
           RG="${{ vars.STAGING_RG }}"
           az containerapp update -g "$RG" -n "$APP_PREFIX-stg-api"    --image "$ACR_NAME.azurecr.io/kadai-api:$IMAGE_TAG"
           az containerapp update -g "$RG" -n "$APP_PREFIX-stg-worker" --image "$ACR_NAME.azurecr.io/kadai-api:$IMAGE_TAG"
@@ -96,6 +97,7 @@ jobs:
   production:
     name: Deploy to production
     needs: staging
+    if: ${{ vars.PROD_RG }}
     runs-on: ubuntu-latest
     # Add required reviewers to the "production" environment in GitHub settings for a manual approval gate
     environment: production
@@ -114,6 +116,7 @@ jobs:
             --source "$ACR_NAME.azurecr.io/kadai-web:prod-$IMAGE_TAG" --image "kadai-web:prod-$IMAGE_TAG"
       - name: Roll out new revisions
         run: |
+          az config set extension.use_dynamic_install=yes_without_prompt
           RG="${{ vars.PROD_RG }}"
           PROD_ACR="${{ vars.PROD_ACR_NAME }}"
           az containerapp update -g "$RG" -n "$APP_PREFIX-prod-api"    --image "$PROD_ACR.azurecr.io/kadai-api:$IMAGE_TAG"
