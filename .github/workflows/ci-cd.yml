@@ -1,0 +1,123 @@
+name: CI/CD
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # OIDC login to Azure, no stored passwords
+  contents: read
+
+env:
+  ACR_NAME: ${{ vars.ACR_NAME }}           # e.g. kadaiacr123
+  APP_PREFIX: ${{ vars.APP_PREFIX }}       # e.g. kadai
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  api:
+    name: API - test
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: api } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: if [ -f package-lock.json ]; then npm ci; else npm install --no-audit --no-fund; fi
+      - name: Syntax check
+        run: for f in $(find src -name '*.js'); do node --check "$f"; done
+      - run: npm test
+      - run: npm audit --omit=dev --audit-level=high || true
+
+  web:
+    name: Web - lint and build
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: web } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: if [ -f package-lock.json ]; then npm ci; else npm install --no-audit --no-fund; fi
+      - run: npm run lint
+      - run: npm run build
+        env: { NEXT_PUBLIC_API_URL: http://localhost:4000 }
+
+  images:
+    name: Build and push images
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [api, web]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - run: az acr login --name "$ACR_NAME"
+      - name: API image
+        run: |
+          docker build -t "$ACR_NAME.azurecr.io/kadai-api:$IMAGE_TAG" api
+          docker push "$ACR_NAME.azurecr.io/kadai-api:$IMAGE_TAG"
+      - name: Web image
+        run: |
+          docker build --build-arg NEXT_PUBLIC_API_URL="${{ vars.STAGING_API_URL }}" \
+            -t "$ACR_NAME.azurecr.io/kadai-web:staging-$IMAGE_TAG" web
+          docker push "$ACR_NAME.azurecr.io/kadai-web:staging-$IMAGE_TAG"
+          docker build --build-arg NEXT_PUBLIC_API_URL="${{ vars.PROD_API_URL }}" \
+            -t "$ACR_NAME.azurecr.io/kadai-web:prod-$IMAGE_TAG" web
+          docker push "$ACR_NAME.azurecr.io/kadai-web:prod-$IMAGE_TAG"
+
+  staging:
+    name: Deploy to staging
+    needs: images
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Roll out new revisions
+        run: |
+          RG="${{ vars.STAGING_RG }}"
+          az containerapp update -g "$RG" -n "$APP_PREFIX-stg-api"    --image "$ACR_NAME.azurecr.io/kadai-api:$IMAGE_TAG"
+          az containerapp update -g "$RG" -n "$APP_PREFIX-stg-worker" --image "$ACR_NAME.azurecr.io/kadai-api:$IMAGE_TAG"
+          az containerapp update -g "$RG" -n "$APP_PREFIX-stg-web"    --image "$ACR_NAME.azurecr.io/kadai-web:staging-$IMAGE_TAG"
+      - name: Smoke test
+        run: |
+          for i in 1 2 3 4 5 6; do
+            curl -fsS "${{ vars.STAGING_API_URL }}/health" && exit 0
+            sleep 10
+          done
+          exit 1
+
+  production:
+    name: Deploy to production
+    needs: staging
+    runs-on: ubuntu-latest
+    # Add required reviewers to the "production" environment in GitHub settings for a manual approval gate
+    environment: production
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Promote the tested images into the production registry
+        run: |
+          PROD_ACR="${{ vars.PROD_ACR_NAME }}"
+          az acr import --name "$PROD_ACR" --force \
+            --source "$ACR_NAME.azurecr.io/kadai-api:$IMAGE_TAG" --image "kadai-api:$IMAGE_TAG"
+          az acr import --name "$PROD_ACR" --force \
+            --source "$ACR_NAME.azurecr.io/kadai-web:prod-$IMAGE_TAG" --image "kadai-web:prod-$IMAGE_TAG"
+      - name: Roll out new revisions
+        run: |
+          RG="${{ vars.PROD_RG }}"
+          PROD_ACR="${{ vars.PROD_ACR_NAME }}"
+          az containerapp update -g "$RG" -n "$APP_PREFIX-prod-api"    --image "$PROD_ACR.azurecr.io/kadai-api:$IMAGE_TAG"
+          az containerapp update -g "$RG" -n "$APP_PREFIX-prod-worker" --image "$PROD_ACR.azurecr.io/kadai-api:$IMAGE_TAG"
+          az containerapp update -g "$RG" -n "$APP_PREFIX-prod-web"    --image "$PROD_ACR.azurecr.io/kadai-web:prod-$IMAGE_TAG"
+      - name: Smoke test
+        run: curl -fsS --retry 6 --retry-delay 10 --retry-all-errors "${{ vars.PROD_API_URL }}/health"
